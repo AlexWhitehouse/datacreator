@@ -6,9 +6,11 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import ai, autodetect, config, datatypes, db, render, runs, templates
+from . import ai, autodetect, config, datatypes, db, presets, render, runs, templates, updater
+from . import settings as settings_api
 
 app = FastAPI(title="DataCreator")
+app.include_router(settings_api.router)  # /api/settings
 runs.recover_interrupted()
 
 
@@ -30,8 +32,33 @@ def status():
         "ai_available": ai.available(), "ai_model": config.REQUESTY_MODEL if ai.available() else None,
         "handwriting_fonts": list(render.handwriting_fonts()), "typed_fonts": render.TYPED_FONTS,
         "date_formats": datatypes.DATE_FORMATS, "scan_presets": list(runs.scan.PRESETS),
-        "defaults": runs.DEFAULTS,
+        "defaults": runs.DEFAULTS, "version": updater.VERSION,
     }
+
+
+# ---------------------------------------------------------------- self-update
+
+def _active_runs() -> int:
+    return len(runs.active())
+
+
+@app.get("/api/update")
+def update_status(force: bool = False):
+    """Is a newer version on GitHub? Cached for 10 minutes unless force=1."""
+    return {**updater.check(force=force), "active_runs": _active_runs()}
+
+
+@app.post("/api/update")
+def update_apply():
+    """Fast-forward to the latest version, then restart the server in place."""
+    if _active_runs():
+        raise ValueError("A run is still in progress. Wait for it to finish (or cancel it), then update.")
+    try:
+        result = updater.apply()
+    except updater.UpdateError as e:
+        raise ValueError(str(e))
+    updater.restart_soon()
+    return result
 
 
 @app.get("/api/fonts/{name}.png")
@@ -222,15 +249,28 @@ def autodetect_fields(tid: int, body: dict = Body(default={})):
 @app.post("/api/templates/{tid}/preview")
 def preview(tid: int, body: dict = Body(default={})):
     _get_template(tid)
-    pdf = runs.preview(tid, body or {})
+    pdf = runs.preview([tid], {**(body or {}), "combine": False, "duplicate": False})
+    return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=preview.pdf"})
+
+
+@app.post("/api/preview")
+def preview_set(body: dict = Body(default={})):
+    """Preview with run settings: the whole set as one document when combining several templates."""
+    pdf = runs.preview((body or {}).get("template_ids") or [], body or {})
     return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": "inline; filename=preview.pdf"})
 
 
 # ---------------------------------------------------------------- runs
 
 @app.get("/api/runs")
-def list_runs():
-    return db.query("SELECT * FROM runs ORDER BY created_at DESC LIMIT 100")
+def list_runs(q: str = "", status: str = "", limit: int = 25, offset: int = 0):
+    """One page of runs, newest first, with per-status counts for the search."""
+    return runs.search(q, status, limit, offset)
+
+
+@app.get("/api/runs/active")
+def active_runs():
+    return runs.active()
 
 
 @app.post("/api/runs")
@@ -238,31 +278,37 @@ def start_run(body: dict = Body(...)):
     return runs.start(body)
 
 
-@app.get("/api/runs/{run_id}")
-def get_run(run_id: str):
+def _run_or_404(run_id: str) -> dict:
+    runs.run_dir(run_id)  # rejects malformed ids before they reach the filesystem
     r = db.query_one("SELECT * FROM runs WHERE id = ?", (run_id,))
     if r is None:
-        raise HTTPException(404)
+        raise HTTPException(404, "Run not found")
     return r
+
+
+@app.get("/api/runs/{run_id}")
+def get_run(run_id: str):
+    return runs.with_queue_positions([_run_or_404(run_id)])[0]
 
 
 @app.post("/api/runs/{run_id}/cancel")
 def cancel_run(run_id: str):
-    db.execute("UPDATE runs SET status = 'cancelling' WHERE id = ? AND status IN ('queued', 'running')", [run_id])
+    _run_or_404(run_id)
+    runs.cancel(run_id)
     return {"ok": True}
 
 
 @app.get("/api/runs/{run_id}/download")
 def download_run(run_id: str):
-    r = db.query_one("SELECT status FROM runs WHERE id = ?", (run_id,))
-    if r is None or r["status"] != "done":
+    if _run_or_404(run_id)["status"] != "done":
         raise HTTPException(404, "Run not finished")
     return FileResponse(runs.zip_path(run_id), filename=f"datacreator-{run_id}.zip")
 
 
 @app.get("/api/runs/{run_id}/ground_truth.json")
 def run_ground_truth(run_id: str):
-    p = config.RUNS_DIR / run_id / "ground_truth.json"
+    _run_or_404(run_id)
+    p = runs.run_dir(run_id) / "ground_truth.json"
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(p)
@@ -270,10 +316,35 @@ def run_ground_truth(run_id: str):
 
 @app.delete("/api/runs/{run_id}")
 def delete_run(run_id: str):
-    r = db.query_one("SELECT status FROM runs WHERE id = ?", (run_id,))
-    if r and r["status"] in ("queued", "running", "cancelling"):
+    if _run_or_404(run_id)["status"] in runs.ACTIVE_STATUSES:
         raise ValueError("This run is still active: cancel it and wait for it to stop first")
     runs.delete(run_id)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- presets
+
+@app.get("/api/presets")
+def list_presets():
+    return presets.list_all()
+
+
+@app.post("/api/presets")
+def create_preset(body: dict = Body(...)):
+    return presets.create(body.get("name"), body.get("settings"))
+
+
+@app.put("/api/presets/{pid}")
+def update_preset(pid: int, body: dict = Body(...)):
+    p = presets.update(pid, body.get("name"), body.get("settings"))
+    if p is None:
+        raise HTTPException(404, "Preset not found")
+    return p
+
+
+@app.delete("/api/presets/{pid}")
+def delete_preset(pid: int):
+    presets.delete(pid)
     return {"ok": True}
 
 

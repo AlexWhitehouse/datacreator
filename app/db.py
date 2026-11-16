@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS templates (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    settings TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -98,6 +105,12 @@ def execute(sql: str, params=()) -> int:
     with tx() as c:
         cur = c.execute(sql, tuple(_enc(p) for p in params))
         return cur.lastrowid
+
+
+def change(sql: str, params=()) -> int:
+    """Run a write and return how many rows it changed."""
+    with tx() as c:
+        return c.execute(sql, tuple(_enc(p) for p in params)).rowcount
 
 
 def update(table: str, key_col: str, key, values: dict) -> None:

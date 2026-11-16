@@ -43,7 +43,7 @@ main() {
   if [ ! -f .env ]; then
     cp .env.example .env
     chmod 600 .env
-    say "Created .env (add REQUESTY_API_KEY to turn on AI features)"
+    say "Created .env (add an AI key in the app under Settings to turn on AI features)"
   fi
 
   say "Writing sample forms to samples/"

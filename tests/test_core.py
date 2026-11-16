@@ -15,13 +15,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @pytest.fixture(scope="session")
 def client(tmp_path_factory):
-    data = tmp_path_factory.mktemp("data")
-    os.environ["DATACREATOR_DATA"] = str(data)
-    os.environ["REQUESTY_API_KEY"] = ""  # never call the AI from tests
-    sys.path.insert(0, str(ROOT))
+    # conftest.py has already pointed DATACREATOR_DATA at a temp dir and blanked the AI key
     from fastapi.testclient import TestClient
 
+    from app import config
     from app.main import app
+    assert config.DATA_DIR == Path(os.environ["DATACREATOR_DATA"]) and config.DATA_DIR != ROOT / "data"
     samples = tmp_path_factory.mktemp("samples")
     sys.argv = ["x", str(samples)]
     import runpy
@@ -211,3 +210,111 @@ def test_free_area_rules_for_word_style_cells(client):
     tall = [40, 95, 300, 180]
     free, label, ph = _free_area(tall, [w(45, 120, "Prescriber"), w(122, 160, "Notes:", no=1)])
     assert free[1] > 110 and free[3] == 179.5
+
+
+def test_combined_run_puts_each_set_in_one_document(client):
+    ids = [_upload(client, "referral_form"), _upload(client, "prescription")]  # 2 pages + 1 page
+    assert client.put(f"/api/templates/{ids[0]}", json={"fields": [
+        {"name": "patient", "type": "full_name", "page": 1, "rect": [100, 138, 555, 158], "options": {"required": True}}]}).status_code == 200
+    assert client.put(f"/api/templates/{ids[1]}", json={"fields": [
+        {"name": "patient", "type": "full_name", "page": 0, "rect": [120, 76, 420, 96], "options": {"required": True}}]}).status_code == 200
+    # prescription first: the order of template_ids is the page order
+    order = [ids[1], ids[0]]
+    pdf = client.post("/api/preview", json={"template_ids": order, "combine": True, "seed": 3}).content
+    assert pymupdf.open(stream=pdf).page_count == 3
+    run = client.post("/api/runs", json={"template_ids": order, "count": 3, "seed": 9, "combine": True,
+                                         "layout": "folders", "formats": ["pdf", "png"]}).json()
+    for _ in range(240):
+        r = client.get(f"/api/runs/{run['id']}").json()
+        if r["status"] in ("done", "failed"):
+            break
+        time.sleep(0.5)
+    assert r["status"] == "done", r["message"]
+    assert r["total"] == 3 and r["summary"]["documents"] == 3 and r["summary"]["forms"] == 6
+    out = Path(r["summary"]["output_dir"])
+    doc = pymupdf.open(out / "set_0001" / "set_0001.pdf")
+    assert doc.page_count == 3 and len(list((out / "set_0001").glob("*.png"))) == 3
+    gt = json.loads((out / "ground_truth.json").read_text())
+    s1 = [d for d in gt["documents"] if d["set"] == 1]
+    assert [d["first_page"] for d in s1] == [1, 2] and s1[0]["files"] == s1[1]["files"]
+    rx, ref = ({f["name"]: f for f in d["fields"]} for d in s1)
+    assert rx["patient"]["value"] == ref["patient"]["value"]          # same patient on both forms
+    assert (rx["patient"]["merged_page"], ref["patient"]["merged_page"]) == (1, 3)
+    words = " ".join(w[4] for w in doc[2].get_text("words"))
+    assert ref["patient"]["value"].split()[-1] in words               # drawn on the referral's 2nd page
+
+
+def _wait(client, run_id):
+    for _ in range(240):
+        r = client.get(f"/api/runs/{run_id}").json()
+        if r["status"] in ("done", "failed"):
+            return r
+        time.sleep(0.5)
+    return r
+
+
+def _referral_with_fields(client):
+    tid = _upload(client, "referral_form")
+    rows = [("surname", "last_name", [240, 108, 555, 128]), ("forename", "first_name", [100, 138, 555, 158]),
+            ("dob", "date_of_birth", [110, 168, 230, 188]), ("address", "address_line_1", [100, 228, 555, 248]),
+            ("postcode", "postcode", [100, 258, 230, 278]), ("phone", "phone_mobile", [300, 258, 555, 278]),
+            ("nok", "full_name", [130, 388, 360, 408])]
+    fields = [{"name": n, "type": t, "page": 0, "rect": r} for n, t, r in rows]
+    fields.append({"name": "nhs", "type": "nhs_number", "page": 0, "rect": [110, 198, 270, 216], "options": {"required": True}})
+    fields += [{"name": "consent", "type": "yes_no", "page": 1, "rect": r, "render": "checkbox", "options": {"check_value": v}}
+               for r, v in (([222, 239, 235, 252], "Yes"), ([268, 239, 281, 252], "No"))]
+    assert client.put(f"/api/templates/{tid}", json={"fields": fields}).status_code == 200
+    return tid
+
+
+def test_settings_missing_range_and_duplicate_counts(client):
+    from app.runs import document_count, normalise_settings
+    s = normalise_settings({"template_ids": [1], "missing_pct": 25})
+    assert (s["missing_min"], s["missing_max"]) == (25, 25)                      # older single rate
+    s = normalise_settings({"template_ids": [1, 2], "missing_min": 60, "missing_max": 10, "count": 10,
+                            "duplicate": True, "duplicate_pct": 25, "duplicate_levels": [50, "100", 50, 0, 120]})
+    assert (s["missing_min"], s["missing_max"]) == (10, 60)
+    assert s["duplicate_levels"] == [100, 50, 0]
+    assert document_count(s) == (10 + 3 * 2) * 2                                  # 3 of 10 sets × 3 versions, 2 templates
+    assert document_count({**s, "combine": True}) == 10 + 3 * 2
+
+
+def test_missing_range_varies_per_document(client):
+    tid = _referral_with_fields(client)
+    r = _wait(client, client.post("/api/runs", json={"template_ids": [tid], "count": 24, "seed": 5,
+                                                     "missing_min": 0, "missing_max": 100}).json()["id"])
+    assert r["status"] == "done", r["message"]
+    gt = json.loads((Path(r["summary"]["output_dir"]) / "ground_truth.json").read_text())
+    blanks = [d["fields_missing"] for d in gt["documents"]]
+    assert min(blanks) <= 2 and max(blanks) >= 6                                  # some nearly full, some sparse
+    for d in gt["documents"]:
+        f = {x["name"]: x for x in d["fields"] if x["name"] != "consent"}
+        assert not f["nhs"]["missing"]                                             # required
+        ticks = [x["missing"] for x in d["fields"] if x["name"] == "consent"]
+        assert len(set(ticks)) == 1                                                # a question's boxes go blank together
+
+
+def test_duplicates_at_accuracy_levels(client):
+    tid = _referral_with_fields(client)
+    r = _wait(client, client.post("/api/runs", json={"template_ids": [tid], "count": 4, "seed": 11, "layout": "folders",
+                                                     "duplicate": True, "duplicate_pct": 50,
+                                                     "duplicate_levels": [100, 70, 30, 0]}).json()["id"])
+    assert r["status"] == "done", r["message"]
+    assert r["total"] == 4 + 2 * 3 and r["summary"]["duplicated_sets"] == 2
+    out = Path(r["summary"]["output_dir"])
+    gt = json.loads((out / "ground_truth.json").read_text())
+    assert len(gt["documents"]) == 10
+    dup_sets = {d["set"] for d in gt["documents"] if d["accuracy"] is not None}
+    assert len(dup_sets) == 2
+    for st in dup_sets:
+        docs = sorted((d for d in gt["documents"] if d["set"] == st), key=lambda d: -d["accuracy"])
+        assert [d["accuracy"] for d in docs] == [100, 70, 30, 0]
+        assert all((out / f).exists() for d in docs for f in d["files"]) and docs[1]["files"][0].endswith("_acc70.pdf")
+        blank = [{x["name"] for x in d["fields"] if x["missing"]} for d in docs]
+        assert blank[0] == set() and blank[3] == {n for n in (x["name"] for x in docs[0]["fields"]) if n != "nhs"}
+        assert blank[0] <= blank[1] <= blank[2] <= blank[3]                        # nested: each level blanks more
+        assert len({d["style"]["handwriting_font"] for d in docs}) == 1             # same writer
+        for d in docs[1:]:                                                          # filled fields drawn identically
+            assert all(docs[0]["fields"][i]["value"] == x["value"] for i, x in enumerate(d["fields"]) if not x["missing"])
+    plain = [d for d in gt["documents"] if d["accuracy"] is None]
+    assert len(plain) == 2 and not any(f.endswith("_acc100.pdf") for d in plain for f in d["files"])
