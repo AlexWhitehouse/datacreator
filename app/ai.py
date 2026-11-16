@@ -31,10 +31,17 @@ def available() -> bool:
     return bool(config.REQUESTY_API_KEY)
 
 
+def reset_client() -> None:
+    """Forget the cached client so the next call picks up changed settings (key, URL, effort)."""
+    global _client, _effort_supported
+    _client = None
+    _effort_supported = True
+
+
 def _get_client() -> OpenAI:
     global _client
     if not available():
-        raise AiError("AI is not configured: set REQUESTY_API_KEY in .env")
+        raise AiError("AI is not configured: add an AI key on the Settings page")
     if _client is None:
         _client = OpenAI(api_key=config.REQUESTY_API_KEY, base_url=config.REQUESTY_BASE_URL,
                          timeout=120, max_retries=3)

@@ -105,18 +105,27 @@ def _wrap(text: str, font: pymupdf.Font, size: float, max_w: float) -> list[str]
     return lines
 
 
-def _write_hw(page, text, x, baseline, size, font, style: DocStyle, rng, angle=0.0, extra_slant=0.0):
+def _write_hw(page, text, x, baseline, size, font, style: DocStyle, rng, angle=0.0, extra_slant=0.0, mirror=None):
+    """Write handwriting. Returns (x of each character's start plus the end, morph origin, morph matrix), so
+    callers can draw over the same letters; mirror is an optional second page that gets the same ink."""
     if not text:
-        return
+        return None
     tw = pymupdf.TextWriter(page.rect)
     cx = x
+    xs = []
     for i, ch in enumerate(text):
+        xs.append(cx)
         s = size * (1 + rng.uniform(-0.06, 0.06) * style.jitter)
         dy = (rng.uniform(-0.04, 0.04) + 0.03 * math.sin(i / 2.3)) * size * style.jitter
         tw.append((cx, baseline + dy), ch, font=font, fontsize=s)
         cx += font.text_length(ch, fontsize=s) * style.spacing
+    xs.append(cx)
     shear = pymupdf.Matrix(1, 0, -math.tan(math.radians(style.slant + extra_slant)), 1, 0, 0)
-    tw.write_text(page, color=style.ink, morph=(pymupdf.Point(x, baseline), shear * pymupdf.Matrix(angle)))
+    origin, mat = pymupdf.Point(x, baseline), shear * pymupdf.Matrix(angle)
+    tw.write_text(page, color=style.ink, morph=(origin, mat))
+    if mirror is not None:
+        tw.write_text(mirror, color=style.ink, morph=(origin, mat))
+    return xs, origin, mat
 
 
 def _hw_width(text, font, size, style: DocStyle) -> float:
@@ -157,10 +166,96 @@ def _erase_printed_text(page: pymupdf.Page, r: pymupdf.Rect) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# OCR stress: crossings-out and writing that runs outside its box
+# --------------------------------------------------------------------------------------
+
+class _InkMirror:
+    """A blank page the same size as the real one. A field drawn on both can have its real ink measured,
+    free of the form's own printing."""
+
+    def __init__(self, page: pymupdf.Page):
+        self.doc = pymupdf.open()
+        self.doc.new_page(width=page.rect.width, height=page.rect.height)
+        self.page = self.doc[0]
+
+    def bbox(self, around: pymupdf.Rect, dpi: int = 144) -> pymupdf.Rect | None:
+        clip = pymupdf.Rect(around) & self.page.rect
+        if clip.is_empty:
+            return None
+        pix = self.page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, clip=clip, alpha=False)
+        w, h, st, data = pix.width, pix.height, pix.stride, pix.samples
+        rows = [y for y in range(h) if min(data[y * st:y * st + w]) < 200]
+        if not rows:
+            return None
+        cols = [x for x in range(w) if min(data[x + rows[0] * st:(rows[-1] + 1) * st:st]) < 200]
+        k = 72 / dpi
+        return pymupdf.Rect((pix.x + cols[0]) * k, (pix.y + rows[0]) * k,
+                            (pix.x + cols[-1] + 1) * k, (pix.y + rows[-1] + 1) * k)
+
+
+def _strike(pages, x0: float, x1: float, baseline: float, size: float, mark: str, origin, mat, ink, rng) -> None:
+    """Strike through handwriting between x0 and x1 (unmorphed), following its slant and tilt."""
+    P = lambda x, y: (pymupdf.Point(x, y) - origin) * mat + origin
+    width = max(0.6, size * rng.uniform(0.055, 0.075))
+    a, b = x0 - size * rng.uniform(0.05, 0.15), x1 + size * rng.uniform(0.0, 0.15)
+    paths = []
+    if mark == "scribble":
+        # a dense back-and-forth over the word, there and back, so it reads as scribbled out, not as letters
+        top, bottom = baseline - size * 0.6, baseline + size * 0.04
+        n = max(6, int((b - a) / (size * rng.uniform(0.08, 0.12))))
+        xs = [a + (b - a) * i / n for i in range(n + 1)]
+        xs += xs[-2::-1]
+        pts = [P(x + rng.uniform(-0.03, 0.03) * size, (top if i % 2 else bottom) + rng.uniform(-0.1, 0.1) * size)
+               for i, x in enumerate(xs)]
+        paths.append(pts)
+    else:
+        heights = (0.30,) if mark == "line" else (0.20, 0.42)
+        for hgt in heights:
+            y = baseline - size * (hgt + rng.uniform(-0.05, 0.05))
+            paths.append([P(a, y + rng.uniform(-0.06, 0.06) * size), P(b, y + rng.uniform(-0.06, 0.06) * size)])
+    for pg in pages:
+        if pg is None:
+            continue
+        for pts in paths:
+            pg.draw_polyline(pts, color=ink, width=width, lineCap=1, lineJoin=1)
+
+
+def _strike_drawn(pages, res, n: int, baseline: float, size: float, cross: dict, style: DocStyle) -> None:
+    """Strike the first n characters of a _write_hw result."""
+    if not res or n <= 0:
+        return
+    xs, origin, mat = res
+    _strike(pages, xs[0], xs[min(n, len(xs) - 1)], baseline, size, cross.get("mark") or "line", origin, mat,
+            style.ink, random.Random(cross.get("seed", 0)))
+
+
+def _record_ink(fx: dict, mirror: _InkMirror | None, r: pymupdf.Rect, page_rect: pymupdf.Rect) -> None:
+    if mirror is None:
+        return
+    bb = mirror.bbox(pymupdf.Rect(r.x0 - 40, r.y0 - 40, page_rect.x1, r.y1 + 120))
+    if bb is None:
+        return
+    fx["ink_rect"] = [round(v, 1) for v in bb]
+    fx["overflow"] = bb.x1 > r.x1 + 0.5 or bb.y1 > r.y1 + 0.5 or bb.x0 < r.x0 - 0.5 or bb.y0 < r.y0 - 0.5
+
+
+# --------------------------------------------------------------------------------------
 # Field renderers. Each returns what was actually drawn (for the ground truth).
 # --------------------------------------------------------------------------------------
 
-def _text_field(page, r: pymupdf.Rect, text: str, opts: dict, hw: bool, style: DocStyle, rng, multiline: bool):
+def _text_field(page, r: pymupdf.Rect, text: str, opts: dict, hw: bool, style: DocStyle, rng, multiline: bool,
+                fx: dict | None = None):
+    """fx (handwriting only) asks for OCR stress effects and gets their results back:
+    fx["crossout"] = {"struck", "mark", "seed"} writes `struck`, crosses it out, then writes the value;
+    fx["overflow"] = {"grow", "drop", "mode", "wide", "below"} lets the writing run past the box's right and/or
+    bottom edge instead of shrinking it to fit (clipped to the page). Sets fx["crossed_out"], fx["ink_rect"] and
+    fx["overflow"] for what was actually drawn. With no fx this draws exactly what it always has."""
+    fx = fx if fx is not None else {}
+    cross = fx.get("crossout") if hw else None
+    over = fx.get("overflow") if hw else None
+    struck = (cross or {}).get("struck") or ""
+    mirror = _InkMirror(page) if over else None
+    mpage = mirror.page if mirror else None
     pad = min(3.0 if not hw else 2.0, r.width * 0.06)
     max_w = (r.width - 2 * pad) * (0.94 if hw else 1.0)
     fixed = float(opts.get("font_size") or 0)
@@ -178,31 +273,63 @@ def _text_field(page, r: pymupdf.Rect, text: str, opts: dict, hw: bool, style: D
     line_gap = 1.35 if hw else 1.2
 
     if multiline:
-        while True:
-            lines = _wrap(text, font, size, max_w)
-            if len(lines) * size * line_gap <= r.height - pad or size <= 5:
-                break
-            size -= 0.5
-        max_lines = max(1, int((r.height - pad) // (size * line_gap)))
-        lines = lines[:max_lines]
+        wrap_w, room = max_w, r.height - pad
+        if over:  # bigger writing, lines a little too long, and up to a couple of lines below the box
+            size *= over["grow"]
+            wrap_w = max_w * over["wide"]
+            room = min(room + over["below"] * size * line_gap, page.rect.y1 - 4 - r.y0 - pad)
+            wrap_w = min(wrap_w, page.rect.x1 - 6 - r.x0 - pad)
+
+        def layout(body, size):
+            while True:
+                lines = _wrap(body, font, size, wrap_w)
+                if len(lines) * size * line_gap <= room or size <= 5:
+                    break
+                size -= 0.5
+            return size, lines[:max(1, int(room // (size * line_gap)))]
+
+        start_size = size
+        size, lines = layout(f"{struck} {text}" if struck else text, size)
+        if struck and len(" ".join(lines)) <= len(struck) + 1:  # no room left for the value itself
+            struck = ""
+            size, lines = layout(text, start_size)
         y = r.y0 + pad + size * (0.95 if hw else 0.9)
-        for line in lines:
+        for li, line in enumerate(lines):
             x = r.x0 + pad + (rng.uniform(0, 3) * style.jitter if hw else 0)
             if hw:
-                _write_hw(page, line, x, y, size, font, style, rng,
-                          angle=_tilt(rng, 1.2, _hw_width(line, font, size, style), size))
+                res = _write_hw(page, line, x, y, size, font, style, rng,
+                                angle=_tilt(rng, 1.2, _hw_width(line, font, size, style), size), mirror=mpage)
+                if li == 0 and struck:
+                    _strike_drawn((page, mpage), res, len(struck), y, size, cross, style)
             else:
                 _write_typed(page, line, x, y, size, font)
             y += size * line_gap
-        return "\n".join(lines)
+        drawn = "\n".join(lines)
+        if struck:
+            drawn = drawn[len(struck) + 1:]
+            fx["crossed_out"] = struck
+        _record_ink(fx, mirror, r, page.rect)
+        return drawn
 
     if "\n" in text:  # a multi-line value (e.g. an address) in a one-line box
         text = ", ".join(x.strip() for x in text.splitlines() if x.strip())
+    def body():
+        return f"{struck} {text}" if struck else text
     def width(s, t=None):
-        t = text if t is None else t
+        t = body() if t is None else t
         return _hw_width(t, font, s, style) if hw else font.text_length(t, fontsize=s)
     limit = max_w - (4 if hw else 0)
     min_size = 5.0 if hw else 5.5
+    if struck and not over:  # the correction has to fit beside the struck text, or it isn't made
+        for cand in (struck, struck[:2]):
+            if width(min_size, f"{cand} {text}") <= limit:
+                struck = cand
+                break
+        else:
+            struck = ""
+    if over:
+        return _overflow_line(page, r, text, struck, cross, over, font, size, width, min_size, pad, style, rng, mirror,
+                              fx)
     while width(size) > limit and size > min_size:
         size -= 0.25
     # still too long at the smallest legible size: drop words rather than spill out of the box
@@ -220,10 +347,44 @@ def _text_field(page, r: pymupdf.Rect, text: str, opts: dict, hw: bool, style: D
         x = r.x0 + pad + (rng.uniform(0, 4) * style.jitter if hw else 0)
     if hw:
         baseline = r.y1 - r.height * rng.uniform(0.18, 0.28)
-        _write_hw(page, text, x, baseline, size, font, style, rng, angle=_tilt(rng, 1.5, w, r.height))
+        res = _write_hw(page, body(), x, baseline, size, font, style, rng, angle=_tilt(rng, 1.5, w, r.height))
+        if struck:
+            _strike_drawn((page,), res, len(struck), baseline, size, cross, style)
+            fx["crossed_out"] = struck
     else:
         baseline = r.y0 + (r.height + size * 0.7) / 2
         _write_typed(page, text, x, baseline, size, font)
+    return text
+
+
+def _overflow_line(page, r, text, struck, cross, over, font, size, width, min_size, pad, style, rng, mirror, fx):
+    """One line of handwriting that isn't shrunk to its box: it starts at the left and runs on past the right
+    edge, and/or sits low so it crosses the bottom edge. It still stays on the page."""
+    size = min(size * over["grow"], 26.0)
+    x = r.x0 + pad + rng.uniform(0, 4) * style.jitter
+    full = lambda: f"{struck} {text}" if struck else text
+    drop = over["drop"]
+    if over["mode"] == "right" and x + width(size, full()) <= r.x1 - pad:
+        drop = max(drop, 0.12)  # too short to run off the right: write it low instead
+    elif over["mode"] == "right":
+        drop = -0.25  # on the usual line; only the right edge is crossed
+    # letters no taller than the box allows from the chosen baseline (writing spills right/down, not up)
+    size = min(size, (r.height + 1) / max(0.75 - max(drop, -0.25), 0.3))
+    right = page.rect.x1 - 4
+    while x + width(size, full()) > right and size > min_size:
+        size -= 0.25
+    while x + width(size, full()) > right and " " in text.strip():
+        text = text.rsplit(" ", 1)[0].rstrip(",;")
+    while x + width(size, full()) > right and len(text) > 1:
+        text = text[:-1]
+    baseline = min(r.y1 + size * drop, page.rect.y1 - 3 - size * 0.3)
+    w = width(size, full())
+    res = _write_hw(page, full(), x, baseline, size, font, style, rng, angle=_tilt(rng, 1.5, w, r.height),
+                    mirror=mirror.page)
+    if struck:
+        _strike_drawn((page, mirror.page), res, len(struck), baseline, size, cross, style)
+        fx["crossed_out"] = struck
+    _record_ink(fx, mirror, r, page.rect)
     return text
 
 
@@ -295,7 +456,10 @@ def is_checked(value, text: str, opts: dict) -> bool:
     return bool(text.strip()) and text.strip().lower() not in ("no", "n", "false", "0")
 
 
-def render_field(page: pymupdf.Page, f: dict, text: str, value, hw: bool, style: DocStyle, rng: random.Random):
+def render_field(page: pymupdf.Page, f: dict, text: str, value, hw: bool, style: DocStyle, rng: random.Random,
+                 fx: dict | None = None):
+    """Draw one field and return what was drawn. fx carries OCR stress effects for handwritten text fields
+    (see _text_field); tick boxes, signatures and character boxes ignore it."""
     r = pymupdf.Rect(f["rect"])
     opts = f.get("options") or {}
     kind = f.get("render") or "text"
@@ -307,7 +471,7 @@ def render_field(page: pymupdf.Page, f: dict, text: str, value, hw: bool, style:
         return _signature(page, r, text, style, rng)
     if kind == "comb":
         return _comb_field(page, r, text, opts, hw, style, rng)
-    return _text_field(page, r, text, opts, hw, style, rng, multiline=(kind == "multiline"))
+    return _text_field(page, r, text, opts, hw, style, rng, multiline=(kind == "multiline"), fx=fx)
 
 
 def font_sample_png(name: str, signature: bool = False) -> bytes:

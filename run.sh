@@ -31,7 +31,7 @@ if [ -n "${FRESH:-}" ] || [ -n "$SETUP_ONLY" ]; then
 fi
 [ -z "$SETUP_ONLY" ] || exit 0
 
-[ -f .env ] || echo "Note: no .env file. AI data types are disabled until you create one (see .env.example)."
+[ -f .env ] || echo "Note: no AI key yet. AI features are off until you add one in Settings (gear icon, top right)."
 
 PORT="${PORT:-8765}"
 echo "DataCreator running at http://127.0.0.1:${PORT}  (Ctrl+C to stop)"
