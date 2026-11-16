@@ -16,7 +16,7 @@ done
 
 if [ ! -x .venv/bin/python ]; then
   echo "Setting up Python environment..."
-  if ! python3 -m venv .venv 2>/dev/null; then
+  if ! python3 -m venv .venv >/dev/null 2>&1; then
     # Some distros ship Python without ensurepip: create the venv bare and bootstrap pip.
     rm -rf .venv
     python3 -m venv --without-pip .venv
