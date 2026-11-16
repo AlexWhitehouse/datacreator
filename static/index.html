@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DataCreator</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/templates"><img src="/icon.svg" alt="" width="26" height="26"> DataCreator</a>
+    <nav class="tabs">
+      <a href="#/templates" data-tab="templates">Templates</a>
+      <a href="#/types" data-tab="types">Data types</a>
+      <a href="#/generate" data-tab="generate">Generate</a>
+      <a href="#/runs" data-tab="runs">Runs</a>
+    </nav>
+    <div class="topbar-right" id="ai-status"></div>
+  </header>
+  <main id="view"></main>
+  <div id="toasts"></div>
+  <div id="modal-root"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

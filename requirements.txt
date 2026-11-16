@@ -1,0 +1,9 @@
+Faker==40.54.0
+fastapi==0.162.6
+numpy==2.5.4
+openai==3.50.0
+pillow==13.0.0
+pymupdf==2.1
+python-dotenv==1.2.4
+python-multipart==0.0.33
+uvicorn[standard]==0.54.0
